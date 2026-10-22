@@ -1,0 +1,524 @@
+import mongoose from 'mongoose';
+import { asyncHandler } from '../utils/asyncHandler.js';
+import { ApiError } from '../utils/apiError.js';
+import Submission from '../models/Submission.js';
+import Assignment from '../models/Assignment.js';
+import GradingResult from '../models/GradingResult.js';
+import RevisionPlan from '../models/RevisionPlan.js';
+import ClassModel from '../models/ClassModel.js';
+import { runAssessmentPipeline } from '../ai/orchestrator/assessmentOrchestrator.js';
+import { parseHandwrittenOCR } from '../ai/agents/ocrAgent.js';
+import { runPreflightCheck } from '../ai/agents/preflightAgent.js';
+import { runConsistencyAudit, generateReTeachPlan } from '../ai/agents/analyticsEnhancementAgent.js';
+import { logger } from '../utils/logger.js';
+import { awardUserXP } from '../utils/gamification.js';
+
+/**
+ * Normalizes text/code by stripping comments, non-alphanumeric chars, and duplicate whitespace
+ */
+function normalizeForComparison(text = '') {
+  return text
+    .replace(/#.*$/gm, '') // Remove Python comments
+    .replace(/\/\/.*$/gm, '') // Remove JS comments
+    .replace(/\/\*[\s\S]*?\*\//g, '') // Remove block comments
+    .replace(/"""[\s\S]*?"""|'''[\s\S]*?'''/g, '') // Remove docstrings
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Builds character/word n-gram frequency map
+ */
+function getNGrams(text, n = 3) {
+  const words = text.split(' ').filter(Boolean);
+  if (words.length < n) return new Set(words);
+  const ngrams = new Set();
+  for (let i = 0; i <= words.length - n; i++) {
+    ngrams.add(words.slice(i, i + n).join(' '));
+  }
+  return ngrams;
+}
+
+/**
+ * Computes Jaccard similarity across n-grams (robust to variable renaming)
+ */
+function computeNgramSimilarity(textA, textB) {
+  const normA = normalizeForComparison(textA);
+  const normB = normalizeForComparison(textB);
+  if (!normA || !normB) return 0;
+  if (normA === normB) return 1.0;
+
+  const setA = getNGrams(normA, 3);
+  const setB = getNGrams(normB, 3);
+
+  if (!setA.size || !setB.size) return 0;
+
+  let intersectionCount = 0;
+  for (const item of setA) {
+    if (setB.has(item)) intersectionCount++;
+  }
+
+  const unionSize = setA.size + setB.size - intersectionCount;
+  return unionSize > 0 ? intersectionCount / unionSize : 0;
+}
+
+/**
+ * 1. Standard Student Submission
+ */
+export const createSubmission = asyncHandler(async (req, res) => {
+  const { assignmentId, answerText } = req.body;
+  if (!answerText) throw new ApiError(400, 'answerText is required');
+  const assignment = await Assignment.findById(assignmentId);
+  if (!assignment) throw new ApiError(404, 'Assignment not found');
+
+  const submission = await Submission.create({
+    assignment: assignmentId,
+    student: req.user._id,
+    studentName: req.user.name,
+    answerText,
+    status: 'submitted'
+  });
+
+  res.status(201).json({ submission });
+
+  // Kick off AI evaluation pipeline asynchronously
+  submission.status = 'ai_processing';
+  await submission.save();
+  runAssessmentPipeline({ submission, assignment })
+    .then(async () => {
+      submission.status = 'ai_evaluated';
+      await submission.save();
+
+      // Award XP for completing an assignment submission
+      if (submission.student) {
+        await awardUserXP(submission.student, 'ASSIGNMENT_SUBMISSION', String(assignment._id));
+      }
+    })
+    .catch(async (err) => {
+      logger.error('Assessment pipeline failed:', err.message);
+      submission.status = 'submitted';
+      await submission.save();
+    });
+});
+
+/**
+ * 1.1 Public Student Portal Submission (No Login Required)
+ * POST /api/submissions/public/:assignmentId
+ */
+export const createPublicSubmission = asyncHandler(async (req, res) => {
+  const { assignmentId } = req.params;
+  const { studentName, rollNumber, answerText } = req.body;
+
+  if (!answerText) throw new ApiError(400, 'answerText is required');
+  if (!studentName && !rollNumber) {
+    throw new ApiError(400, 'studentName or rollNumber is required for public submission');
+  }
+
+  const assignment = await Assignment.findById(assignmentId);
+  if (!assignment) throw new ApiError(404, 'Assignment not found');
+
+  const submission = await Submission.create({
+    assignment: assignmentId,
+    studentName: studentName || `Student ${rollNumber}`,
+    rollNumber: rollNumber || null,
+    isPublicSubmission: true,
+    answerText,
+    status: 'pending'
+  });
+
+  res.status(201).json({
+    message: 'Public submission received successfully',
+    submission
+  });
+
+  // Run AI grading pipeline asynchronously
+  submission.status = 'ai_processing';
+  await submission.save();
+  runAssessmentPipeline({ submission, assignment })
+    .then(async () => {
+      submission.status = 'ai_evaluated';
+      await submission.save();
+    })
+    .catch(async (err) => {
+      logger.error('Public assessment pipeline failed:', err.message);
+      submission.status = 'submitted';
+      await submission.save();
+    });
+});
+
+/**
+ * 1.2 Handwritten OCR Submission
+ * POST /api/submissions/ocr
+ */
+export const ocrSubmission = asyncHandler(async (req, res) => {
+  const { assignmentId, imageInput } = req.body;
+  if (!assignmentId) throw new ApiError(400, 'assignmentId is required');
+  if (!imageInput) throw new ApiError(400, 'imageInput (base64 string or image URL) is required');
+
+  const assignment = await Assignment.findById(assignmentId);
+  if (!assignment) throw new ApiError(404, 'Assignment not found');
+
+  const ocrResult = await parseHandwrittenOCR({ imageInput });
+
+  const submission = await Submission.create({
+    assignment: assignmentId,
+    student: req.user?._id || null,
+    studentName: req.user?.name || 'Handwritten Submission',
+    answerText: ocrResult.transcription,
+    ocrProcessed: true,
+    rawImageUri: typeof imageInput === 'string' && !imageInput.startsWith('data:') ? imageInput : null,
+    status: 'pending'
+  });
+
+  res.status(201).json({
+    message: 'Handwritten OCR transcription completed',
+    submission,
+    ocrResult
+  });
+
+  // Run AI grading pipeline asynchronously
+  submission.status = 'ai_processing';
+  await submission.save();
+  runAssessmentPipeline({ submission, assignment })
+    .then(async () => {
+      submission.status = 'ai_evaluated';
+      await submission.save();
+    })
+    .catch(async (err) => {
+      logger.error('OCR Assessment pipeline failed:', err.message);
+      submission.status = 'submitted';
+      await submission.save();
+    });
+});
+
+/**
+ * 1.3 Pre-Flight AI Coach Check
+ * POST /api/submissions/preflight
+ */
+export const preflightCheck = asyncHandler(async (req, res) => {
+  const { assignmentId, answerText } = req.body;
+  if (!assignmentId || !answerText) {
+    throw new ApiError(400, 'assignmentId and answerText are required');
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(assignmentId)) {
+    throw new ApiError(400, `Invalid assignmentId format: "${assignmentId}"`);
+  }
+
+  const assignment = await Assignment.findById(assignmentId);
+  if (!assignment) throw new ApiError(404, 'Assignment not found');
+
+  const preflightResult = await runPreflightCheck({
+    question: assignment.question || assignment.description || assignment.title,
+    rubric: assignment.rubric || [],
+    draftText: answerText
+  });
+
+  // Award XP if student is logged in
+  if (req.user?._id) {
+    await awardUserXP(req.user._id, 'PREFLIGHT_CHECK');
+  }
+
+  res.json({ preflight: preflightResult });
+});
+
+
+/**
+ * 1.4 Batch Plagiarism & Multi-Submission Similarity Check (Threshold >= 0.80)
+ * POST /api/submissions/plagiarism/:assignmentId
+ */
+export const checkAssignmentPlagiarism = asyncHandler(async (req, res) => {
+  const { assignmentId } = req.params;
+  const assignment = await Assignment.findById(assignmentId);
+  if (!assignment) throw new ApiError(404, 'Assignment not found');
+
+  // Verify authorization for teachers
+  if (req.user?.role === 'teacher') {
+    const cls = await ClassModel.findById(assignment.class);
+    if (!cls || String(cls.teacher) !== String(req.user._id)) {
+      throw new ApiError(403, 'Forbidden: You can only check plagiarism for your own class');
+    }
+  }
+
+  const submissions = await Submission.find({ assignment: assignmentId });
+  if (submissions.length < 2) {
+    return res.json({
+      message: 'Not enough submissions to run batch similarity check (minimum 2 required).',
+      flaggedCount: 0,
+      comparisons: 0,
+      flaggedPairs: []
+    });
+  }
+
+  const flaggedPairs = [];
+  const similarityMap = new Map();
+
+  for (const sub of submissions) {
+    similarityMap.set(String(sub._id), {
+      maxSimilarity: 0,
+      matchedSubmission: null,
+      matchedStudentName: null
+    });
+  }
+
+  const THRESHOLD = 0.80; // 80% similarity threshold
+
+  for (let i = 0; i < submissions.length; i++) {
+    for (let j = i + 1; j < submissions.length; j++) {
+      const subA = submissions[i];
+      const subB = submissions[j];
+
+      // Avoid matching same student duplicate drafts
+      if (subA.student && subB.student && String(subA.student) === String(subB.student)) {
+        continue;
+      }
+
+      const score = computeNgramSimilarity(subA.answerText, subB.answerText);
+      const roundedScore = Number(score.toFixed(3));
+
+      const statsA = similarityMap.get(String(subA._id));
+      if (roundedScore > statsA.maxSimilarity) {
+        statsA.maxSimilarity = roundedScore;
+        statsA.matchedSubmission = subB._id;
+        statsA.matchedStudentName = subB.studentName || 'Student';
+      }
+
+      const statsB = similarityMap.get(String(subB._id));
+      if (roundedScore > statsB.maxSimilarity) {
+        statsB.maxSimilarity = roundedScore;
+        statsB.matchedSubmission = subA._id;
+        statsB.matchedStudentName = subA.studentName || 'Student';
+      }
+
+      if (roundedScore >= THRESHOLD) {
+        flaggedPairs.push({
+          submissionA: { id: subA._id, studentName: subA.studentName },
+          submissionB: { id: subB._id, studentName: subB.studentName },
+          similarity: roundedScore
+        });
+      }
+    }
+  }
+
+  // Update records in DB
+  const bulkOps = submissions.map((sub) => {
+    const stats = similarityMap.get(String(sub._id));
+    const flagged = stats.maxSimilarity >= THRESHOLD;
+    return {
+      updateOne: {
+        filter: { _id: sub._id },
+        update: {
+          $set: {
+            'plagiarism.flagged': flagged,
+            'plagiarism.maxSimilarity': stats.maxSimilarity,
+            'plagiarism.matchedSubmission': stats.matchedSubmission,
+            'plagiarism.matchedStudentName': stats.matchedStudentName,
+            'plagiarism.checkedAt': new Date()
+          }
+        }
+      }
+    };
+  });
+
+  await Submission.bulkWrite(bulkOps);
+
+  res.json({
+    message: `Batch similarity check complete. Evaluated ${submissions.length} submissions.`,
+    flaggedCount: flaggedPairs.length,
+    threshold: THRESHOLD,
+    flaggedPairs
+  });
+});
+
+/**
+ * 2. Trigger AI Grading Pipeline manually
+ * POST /api/grading/:id or POST /api/submissions/grading/:id
+ */
+export const triggerGradingPipeline = asyncHandler(async (req, res) => {
+  const submission = await Submission.findById(req.params.id).populate('assignment');
+  if (!submission) throw new ApiError(404, 'Submission not found');
+
+  submission.status = 'ai_processing';
+  await submission.save();
+
+  const pipelineResult = await runAssessmentPipeline({
+    submission,
+    assignment: submission.assignment
+  });
+
+  submission.status = 'ai_evaluated';
+  await submission.save();
+
+  const revisionPlan = await RevisionPlan.findOne({
+    submission: submission._id,
+    gradingResult: pipelineResult.gradingResult?._id
+  });
+
+  res.json({
+    message: 'AI grading pipeline completed',
+    submission,
+    gradingResult: pipelineResult.gradingResult,
+    quizAttempt: pipelineResult.quizAttempt,
+    revisionPlan
+  });
+});
+
+/**
+ * 3. Consistency Audit
+ */
+export const auditGradingConsistency = asyncHandler(async (req, res) => {
+  const gradingResult = await GradingResult.findById(req.params.id).populate('assignment');
+  if (!gradingResult) throw new ApiError(404, 'Grading result not found');
+
+  const submission = await Submission.findById(gradingResult.submission);
+  const auditResult = await runConsistencyAudit({
+    submissionText: submission?.answerText || '',
+    rubricEvaluation: gradingResult.rubricEvaluation,
+    maxScore: gradingResult.aiMaxScore || 100
+  });
+
+  res.json({ audit: auditResult });
+});
+
+/**
+ * 4. Class Re-Teaching & Peer-Tutoring Generator
+ */
+export const getClassReTeachPlan = asyncHandler(async (req, res) => {
+  const { assignmentId } = req.params;
+  const assignment = await Assignment.findById(assignmentId);
+  if (!assignment) throw new ApiError(404, 'Assignment not found');
+
+  const results = await GradingResult.find({ assignment: assignmentId }).populate('student', 'name email');
+  const studentSummaries = results.map((r) => ({
+    studentId: r.student?._id || r.student,
+    studentName: r.student?.name || 'Student',
+    score: r.aiScore || 0,
+    weakConcepts: r.feedback?.weaknesses || []
+  }));
+
+  const reTeachPlan = await generateReTeachPlan({
+    assignmentTitle: assignment.title,
+    studentGradingResults: studentSummaries
+  });
+
+  res.json({ reTeachPlan });
+});
+
+export const getSubmission = asyncHandler(async (req, res) => {
+  const submission = await Submission.findById(req.params.id).populate('assignment');
+  if (!submission) throw new ApiError(404, 'Submission not found');
+
+  if (req.user?.role === 'student' && submission.student && String(submission.student) !== String(req.user._id)) {
+    throw new ApiError(403, 'Forbidden: You can only view your own submission');
+  }
+
+  if (req.user?.role === 'teacher') {
+    const assignment = submission.assignment;
+    const isDirectTeacher = assignment && String(assignment.teacher) === String(req.user._id);
+    let isClassTeacher = false;
+    if (assignment?.class) {
+      const cls = await ClassModel.findById(assignment.class);
+      if (cls && String(cls.teacher) === String(req.user._id)) {
+        isClassTeacher = true;
+      }
+    }
+    if (!isDirectTeacher && !isClassTeacher) {
+      throw new ApiError(403, 'Forbidden: You can only view submissions for your own class or assignments');
+    }
+  }
+
+  const gradingResult = await GradingResult.findOne({ submission: submission._id });
+  const revisionPlan = await RevisionPlan.findOne({ submission: submission._id });
+  res.json({ submission, gradingResult, revisionPlan });
+});
+
+export const listSubmissions = asyncHandler(async (req, res) => {
+  const filter = {};
+  const assignmentId = req.query.assignmentId || req.params.assignmentId;
+  if (assignmentId) filter.assignment = assignmentId;
+  if (req.user?.role === 'student') filter.student = req.user._id;
+
+  if (req.user?.role === 'teacher') {
+    const teacherClasses = await ClassModel.find({ teacher: req.user._id }).select('_id');
+    const classIds = teacherClasses.map((c) => c._id);
+    const teacherAssignments = await Assignment.find({
+      $or: [{ teacher: req.user._id }, { class: { $in: classIds } }]
+    }).select('_id');
+    const assignmentIds = teacherAssignments.map((a) => a._id);
+
+    if (filter.assignment) {
+      const targetAssignment = await Assignment.findById(filter.assignment);
+      const isOwner = targetAssignment && (
+        String(targetAssignment.teacher) === String(req.user._id) ||
+        classIds.some((cid) => String(cid) === String(targetAssignment.class))
+      );
+      if (!isOwner) {
+        return res.json({ submissions: [] });
+      }
+    } else {
+      filter.assignment = { $in: assignmentIds };
+    }
+  }
+
+  const submissions = await Submission.find(filter)
+    .populate('assignment', 'title maxScore evaluationType')
+    .populate('student', 'name email')
+    .sort({ createdAt: -1 });
+
+  res.json({ submissions });
+});
+
+// Teacher AI calibration: accept, edit, or override
+export const calibrateGrading = asyncHandler(async (req, res) => {
+  const { action, teacherScore, teacherFeedback } = req.body;
+  const gradingResult = await GradingResult.findById(req.params.id).populate('assignment');
+  if (!gradingResult) throw new ApiError(404, 'Grading result not found');
+
+  if (req.user?.role === 'teacher') {
+    const assignment = gradingResult.assignment;
+    const isDirectTeacher = assignment && String(assignment.teacher) === String(req.user._id);
+    let isClassTeacher = false;
+    if (assignment?.class) {
+      const cls = await ClassModel.findById(assignment.class);
+      if (cls && String(cls.teacher) === String(req.user._id)) {
+        isClassTeacher = true;
+      }
+    }
+    if (!isDirectTeacher && !isClassTeacher) {
+      throw new ApiError(403, 'Forbidden: You can only calibrate grading for your own class or assignments');
+    }
+  } else if (req.user?.role !== 'admin') {
+    throw new ApiError(403, 'Forbidden');
+  }
+
+  if (action === 'accept') {
+    gradingResult.teacherScore = gradingResult.aiScore;
+    gradingResult.teacherFeedback = gradingResult.feedback?.explanation || '';
+    gradingResult.teacherStatus = 'accepted';
+  } else if (action === 'edit') {
+    gradingResult.teacherScore = teacherScore ?? gradingResult.aiScore;
+    gradingResult.teacherFeedback = teacherFeedback ?? gradingResult.feedback?.explanation;
+    gradingResult.teacherStatus = 'edited';
+  } else if (action === 'override') {
+    gradingResult.teacherScore = teacherScore;
+    gradingResult.teacherFeedback = teacherFeedback;
+    gradingResult.teacherStatus = 'overridden';
+  } else {
+    throw new ApiError(400, 'action must be accept, edit or override');
+  }
+
+  gradingResult.reviewedBy = req.user._id;
+  gradingResult.reviewedAt = new Date();
+  await gradingResult.save();
+  res.json({ gradingResult });
+});
+
+export const completeJourneyNode = asyncHandler(async (req, res) => {
+  const { nodeId } = req.body;
+  if (!nodeId) throw new ApiError(400, 'nodeId is required');
+
+  const updatedUser = await awardUserXP(req.user._id, 'PRACTICE_QUIZ', nodeId);
+  res.json({ success: true, user: updatedUser });
+});
